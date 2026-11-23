@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Mirakurun decoder wrapper for libarib25 b25.
+
+Why this exists:
+  * Mirakurun spawns a decoder with socket stdio; libarib25's b25 opens its
+    input/output by path and cannot use a socket fd. Bridge stdin/stdout
+    through a pair of FIFOs (the FIFO bridge approach).
+  * If pcscd is cold (auto-exited / just restarted), the vpcd virtual reader
+    needs a few seconds to reconnect and b25's card init fails with
+    code=-4. Relaunch b25 for a short window so a cold PC/SC stack does not
+    fail the whole stream. Data buffered in the input FIFO while b25 is
+    down is limited to the pipe buffer, so only the stream head can be lost.
+  * The FIFO workdir lives in /var/tmp (root filesystem): /tmp is a small
+    tmpfs on this box and must not be a single point of failure.
+  * Any fatal I/O error (e.g. stdout write failure) tears the whole
+    pipeline down instead of deadlocking on a full FIFO.
+
+Behaviour:
+  * stdin EOF  -> close the input FIFO, let b25 drain and exit, then exit.
+  * b25 exit while stdin is still open -> relaunch (bounded), else finish.
+  * SIGTERM/SIGINT -> kill b25 and exit promptly.
+"""
+
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+B25 = "/usr/local/bin/b25"
+WORKDIR_PARENT = "/var/tmp"
+MAX_LAUNCHES = 30          # hard cap on b25 launches per stream
+RELAUNCH_WINDOW = 90.0     # seconds from first launch; relaunch allowed inside
+RELAUNCH_DELAY = 1.0       # pause between b25 launches
+CHUNK = 188 * 1024
+
+stop_event = threading.Event()
+stdin_eof = threading.Event()
+final_event = threading.Event()   # supervisor will not launch b25 again
+proc_ref = {"proc": None}
+workdir_ref = {"dir": None}
+
+
+def kill_b25():
+    proc = proc_ref.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def feeder(src_fd, fifo_path):
+    """Copy stdin -> input FIFO, reopening the FIFO when b25 restarts."""
+    wfd = None
+    pending = None
+    try:
+        while not stop_event.is_set():
+            if pending is None:
+                try:
+                    chunk = os.read(src_fd, CHUNK)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    stdin_eof.set()
+                    break
+                pending = memoryview(chunk)
+            if wfd is None:
+                try:
+                    wfd = os.open(fifo_path, os.O_WRONLY)
+                except OSError:
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.1)
+                    continue
+            try:
+                n = os.write(wfd, pending)
+                pending = pending[n:] if n < len(pending) else None
+            except OSError:
+                # b25 closed its end (restarting): drop the rest of this
+                # chunk (at most one pipe buffer of the stream head) and
+                # reopen for the next b25 instance.
+                pending = None
+                try:
+                    os.close(wfd)
+                except OSError:
+                    pass
+                wfd = None
+                if stdin_eof.is_set() or stop_event.is_set():
+                    break
+                time.sleep(0.1)
+    finally:
+        if wfd is not None:
+            try:
+                os.close(wfd)
+            except OSError:
+                pass
+
+
+def drainer(fifo_path, dst_fd):
+    """Copy output FIFO -> stdout, reopening across b25 restarts.
+
+    A failed write to stdout is fatal: stop everything so the pipeline
+    can never deadlock with b25 blocked on a full, unread FIFO.
+    """
+    while not stop_event.is_set():
+        try:
+            rfd = os.open(fifo_path, os.O_RDONLY)
+        except OSError:
+            break
+        try:
+            while not stop_event.is_set():
+                try:
+                    chunk = os.read(rfd, CHUNK)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break  # b25 closed its end
+                view = memoryview(chunk)
+                try:
+                    while view:
+                        n = os.write(dst_fd, view)
+                        view = view[n:]
+                except OSError:
+                    stop_event.set()
+                    kill_b25()
+                    return
+        finally:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+        if final_event.is_set():
+            break
+
+
+def _terminate(signum, frame):
+    stop_event.set()
+    kill_b25()
+    d = workdir_ref.get("dir")
+    if d:
+        shutil.rmtree(d, ignore_errors=True)
+    os._exit(0)
+
+
+def sweep_stale_workdirs():
+    """Remove FIFO workdirs left behind by SIGKILLed wrapper instances."""
+    try:
+        names = os.listdir(WORKDIR_PARENT)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not name.startswith("b25w."):
+            continue
+        path = os.path.join(WORKDIR_PARENT, name)
+        try:
+            if now - os.path.getmtime(path) > 600:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def main():
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    sweep_stale_workdirs()
+    workdir = tempfile.mkdtemp(prefix="b25w.", dir=WORKDIR_PARENT)
+    workdir_ref["dir"] = workdir
+    fifo_in = os.path.join(workdir, "in")
+    fifo_out = os.path.join(workdir, "out")
+    os.mkfifo(fifo_in)
+    os.mkfifo(fifo_out)
+
+    ft = threading.Thread(target=feeder, args=(0, fifo_in), daemon=True)
+    dt = threading.Thread(target=drainer, args=(fifo_out, 1), daemon=True)
+    ft.start()
+    dt.start()
+
+    started = time.monotonic()
+    launches = 0
+    try:
+        while not stop_event.is_set():
+            launches += 1
+            proc = subprocess.Popen([B25, fifo_in, fifo_out])
+            proc_ref["proc"] = proc
+            proc.wait()
+            proc_ref["proc"] = None
+            if stop_event.is_set() or stdin_eof.is_set():
+                break
+            if launches >= MAX_LAUNCHES:
+                break
+            if time.monotonic() - started > RELAUNCH_WINDOW:
+                break
+            time.sleep(RELAUNCH_DELAY)
+            if stdin_eof.is_set() or stop_event.is_set():
+                break
+    finally:
+        final_event.set()
+        kill_b25()
+        # Give the drainer a moment to flush whatever b25 left in the FIFO.
+        dt.join(timeout=3.0)
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
