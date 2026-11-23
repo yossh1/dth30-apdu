@@ -1,0 +1,148 @@
+# Build/test every push and PR; publish matching version tags after all checks pass.
+# Action versions are pinned to commit SHAs.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v[0-9]*', '[0-9]*.[0-9]*.[0-9]*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate version and release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python3 .github/scripts/release.py version
+      - name: Test release packaging
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+  test:
+    needs: metadata
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            packages: -p dth-common -p dth-proto -p dth-log -p dth10-core -p dth10-usb -p dth10-backend -p dth-cli -p dth10-diag -p dth30-core -p dth30-usb -p dth30-backend -p dth30-diag
+          - os: windows-latest
+            packages: --workspace
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt,rust-src
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --all --check
+      - run: cargo clippy ${{ matrix.packages }} --all-targets --locked -- -D warnings
+      - run: cargo test ${{ matrix.packages }} --locked
+      # The DTH30 series firmware is not a workspace member (it builds for the chip's MIPS
+      # core only), so the steps above do not look at its sources.
+      - name: Firmware format
+        working-directory: crates/dth30-fw
+        run: cargo fmt --check
+      - name: Firmware lints
+        working-directory: crates/dth30-fw
+        env:
+          RUSTC_BOOTSTRAP: 1
+        run: cargo clippy --release -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test -p dth-bondriver --features rtti-check --locked
+
+  binaries:
+    needs: metadata
+    name: binaries (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            packages: --workspace
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            packages: --workspace
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            packages: --workspace
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            packages: -p dth-cli -p dth10-diag -p dth30-diag
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rust-src --target ${{ matrix.target }}
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release ${{ matrix.packages }} --target ${{ matrix.target }} --locked
+      - name: Package binaries, configuration and documentation
+        run: python3 .github/scripts/release.py package --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [metadata, test, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RUN_ID: ${{ github.run_id }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download distribution archives
+        run: gh run download "$RUN_ID" --pattern 'release-*' --dir artifacts
+      - name: Verify completeness and generate SHA-256 checksums
+        run: python3 .github/scripts/release.py collect
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes \
+            --title "$RELEASE_TAG" "${flags[@]}"

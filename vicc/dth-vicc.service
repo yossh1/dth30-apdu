@@ -1,0 +1,15 @@
+[Unit]
+Description=dth-vicc: DT-H30 B-CAS card as a PC/SC virtual reader (vsmartcard vicc + dth serve APDU bridge)
+After=pcscd.service dth-serve.service
+Wants=pcscd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/dth-vicc/dth_vicc.py
+# VirtualICC exits with status 0 when vpcd is not (yet) listening or
+# when the connection drops, so on-failure would not bring it back.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

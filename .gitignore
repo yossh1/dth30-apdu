@@ -1,0 +1,26 @@
+# ビルド生成物
+target/
+*.bin
+*.img
+
+# 純正ファーム由来の入力・記録（本 repo には入れない）
+stream_*.bin
+replay_*.json.gz
+*_dump.bin
+*_readback.bin
+
+# 放送キャプチャ
+*.ts
+
+# 認証情報
+.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# 一時ファイル
+*.tmp
+*.swp
+__pycache__/
+.scribe-cursor.*

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dth-common",
+    "crates/dth-proto",
+    "crates/dth-log",
+    "crates/dth10-core",
+    "crates/dth10-usb",
+    "crates/dth10-diag",
+    "crates/dth10-backend",
+    "crates/dth-cli",
+    "crates/dth-bondriver",
+    "crates/dth30-core",
+    "crates/dth30-usb",
+    "crates/dth30-diag",
+    "crates/dth30-backend",
+]
+# The DTH30 series firmware: built for the chip's MIPS core only, by dth30-core's build
+# script.
+exclude = ["crates/dth30-fw"]
+
+[workspace.package]
+version = "1.1.0"
+edition = "2024"
+# The toolchain is `stable` (rust-toolchain.toml); this is the oldest it may be.
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/i4M1k0SU/DTH10-series-driver"
+
+[workspace.dependencies]
+dth-common = { path = "crates/dth-common" }
+dth-proto = { path = "crates/dth-proto" }
+dth-log = { path = "crates/dth-log" }
+dth10-core = { path = "crates/dth10-core" }
+dth10-usb = { path = "crates/dth10-usb" }
+dth10-backend = { path = "crates/dth10-backend" }
+dth30-core = { path = "crates/dth30-core" }
+dth30-usb = { path = "crates/dth30-usb" }
+dth30-backend = { path = "crates/dth30-backend" }
+nusb = "0.2.9"
+log = "0.4.35"
+env_logger = "0.11.11"
+clap = { version = "4.6.7", features = ["derive"] }
+winresource = "0.1.34"
+jiff = { version = "0.2.45", default-features = false, features = ["std"] }
+
+# Whole-program optimisation for the shipped binaries (the daemon's TS
+# decryption and the DLL's stream copy are the hot paths); the build takes
+# longer, the tests use the dev profile as before.
+[profile.release]
+lto = "fat"
+codegen-units = 1

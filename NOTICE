@@ -1,0 +1,27 @@
+# NOTICE — 構成要素とライセンス
+
+このリポジトリ（dth30-apdu）は、BUFFALO DT-H30/U2 の内蔵 B-CAS カードを
+ホストから汎用 APDU / PC/SC で扱うための拡張と、その解析資料をまとめたものです。
+
+## 構成要素とライセンス
+
+| 構成要素 | 由来 | ライセンス |
+|---|---|---|
+| driver-apdu/ | i4M1k0SU 氏の DTH10-series-driver（MIT）を基にした派生物。自作の APDU 拡張（コマンド 28、`dth apdu`、serve ソケット連携）を含む | MIT（driver-apdu/LICENSE） |
+| vicc/ | 自作。実行時に vsmartcard（GPLv3）の virtualsmartcard パッケージを利用する | GPL-3.0-or-later（vicc/LICENSE） |
+| modeq/、docs/、tools/、README | 自作 | MIT（LICENSE） |
+
+- upstream: https://github.com/i4M1k0SU/DTH10-series-driver
+  基準コミット: ef207fcdc3f143ae1f6b1e6e05ad7742fcd1fe37
+- vsmartcard のソースコードは本 repo に含めていません
+  （実行時依存として別途インストールするものです）。
+
+## 含まないもの
+
+- **BUFFALO / ViXS の純正ファームウェアは一切含みません。**
+  純正ファームのダンプ、起動ストリームの記録（replay データ）、メモリ読み戻し
+  データ、純正ファーム／純正ドライバの逆アセンブル listing は収録していません。
+  modeq/ の実行に必要な純正ストリームは、利用者自身の機器から取得してください。
+- 放送のキャプチャ（TS）は含みません。
+- B-CAS カードの応答・ATR の生データ、カード ID は含みません
+  （調査記録では長さ／ステータスワード／SHA-256 指紋のみを扱いました）。
